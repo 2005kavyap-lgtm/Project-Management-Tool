@@ -1,0 +1,6 @@
+node_modules/
+planpulse.db
+planpulse.db-journal
+.env
+*.log
+.DS_Store
