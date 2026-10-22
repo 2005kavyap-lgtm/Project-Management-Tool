@@ -274,29 +274,47 @@ app.post('/api/projects/:projectId/tasks', authenticateToken, (req, res) => {
       return res.status(400).json({ success: false, message: 'Task title is required.' });
     }
 
+    const project = dbHelper.getProjectById(projectId);
+    if (!project) {
+      return res.status(404).json({ success: false, message: 'Project board not found.' });
+    }
+
+    let validAssignee = null;
+    if (assignedTo) {
+      const parsed = parseInt(assignedTo, 10);
+      if (!isNaN(parsed) && parsed > 0) {
+        const u = dbHelper.getUserById(parsed);
+        if (u) validAssignee = parsed;
+      }
+    }
+
     const taskId = dbHelper.createTask({
       projectId,
-      title,
-      description,
+      title: title.trim(),
+      description: description ? description.trim() : '',
       status: status || 'todo',
       priority: priority || 'medium',
-      assignedTo: assignedTo ? parseInt(assignedTo, 10) : null,
+      assignedTo: validAssignee,
       dueDate: dueDate || null,
-      label: label || '',
+      label: label ? label.trim() : '',
       createdBy: req.user.id
     });
 
     const task = dbHelper.getTaskById(taskId);
 
     // Notify assignee if assigned to someone else
-    if (task.assigned_to && task.assigned_to !== req.user.id) {
-      dbHelper.createNotification({
-        userId: task.assigned_to,
-        senderId: req.user.id,
-        title: 'Task Assigned',
-        message: `${req.user.name} assigned you to "${task.title}".`,
-        taskId: task.id
-      });
+    if (task && task.assigned_to && task.assigned_to !== req.user.id) {
+      try {
+        dbHelper.createNotification({
+          userId: task.assigned_to,
+          senderId: req.user.id,
+          title: 'Task Assigned',
+          message: `${req.user.name} assigned you to "${task.title}".`,
+          taskId: task.id
+        });
+      } catch (notifErr) {
+        console.warn('Could not create notification:', notifErr.message);
+      }
     }
 
     broadcastEvent('TASK_CREATED', { task, projectId });
@@ -307,7 +325,8 @@ app.post('/api/projects/:projectId/tasks', authenticateToken, (req, res) => {
       task
     });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Error creating task.' });
+    console.error('Error creating task:', error);
+    res.status(500).json({ success: false, message: 'Error creating task: ' + error.message });
   }
 });
 

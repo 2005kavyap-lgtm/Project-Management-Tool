@@ -42,6 +42,32 @@ function showToast(message, icon = 'ℹ️') {
 // ==========================================
 async function checkAuth() {
   if (!App.token) {
+    const explicitlyLoggedOut = localStorage.getItem('planpulse_logged_out') === 'true';
+    if (!explicitlyLoggedOut) {
+      // Auto demo sign in as Sarah Chen (Tech Lead) for seamless instant experience
+      try {
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: 'sarah@planpulse.io', password: 'password123' })
+        });
+        const data = await res.json();
+        if (data.success && data.token) {
+          App.token = data.token;
+          App.user = data.user;
+          localStorage.setItem('planpulse_token', data.token);
+          updateUserSidebar();
+          initWebSocket();
+          await loadTeamMembers();
+          await loadProjects();
+          loadNotifications();
+          return;
+        }
+      } catch (e) {
+        console.warn('Auto demo sign-in error:', e);
+      }
+    }
+    updateUserSidebar();
     openAuthModal();
     return;
   }
@@ -64,24 +90,35 @@ async function checkAuth() {
     }
   } catch (err) {
     console.warn('Auth check error:', err);
+    updateUserSidebar();
     openAuthModal();
   }
 }
 
 function updateUserSidebar() {
   const userElem = document.getElementById('sidebarUserArea');
-  if (!userElem || !App.user) return;
+  if (!userElem) return;
 
-  userElem.innerHTML = `
-    <div class="sidebar-user">
-      <img src="${App.user.avatar_url}" alt="${App.user.name}" class="user-avatar" onerror="this.src='https://api.dicebear.com/7.x/avataaars/svg?seed=user'">
-      <div class="user-meta">
-        <div class="user-name">${App.user.name}</div>
-        <div class="user-role">${App.user.role || 'Member'}</div>
+  if (App.user) {
+    userElem.innerHTML = `
+      <div class="sidebar-user">
+        <img src="${App.user.avatar_url}" alt="${App.user.name}" class="user-avatar" onerror="this.src='https://api.dicebear.com/7.x/avataaars/svg?seed=user'">
+        <div class="user-meta">
+          <div class="user-name">${App.user.name}</div>
+          <div class="user-role">${App.user.role || 'Member'}</div>
+        </div>
+        <button class="btn-logout" onclick="logout()" title="Sign Out">🚪</button>
       </div>
-      <button class="btn-logout" onclick="logout()" title="Sign Out">🚪</button>
-    </div>
-  `;
+    `;
+  } else {
+    userElem.innerHTML = `
+      <div style="padding: 1rem 1.25rem; border-top: 1px solid #1e293b;">
+        <button class="btn-primary" style="width: 100%; justify-content: center; font-size: 0.8rem;" onclick="openAuthModal('login')">
+          Sign In
+        </button>
+      </div>
+    `;
+  }
 }
 
 function openAuthModal(tab = 'login') {
@@ -132,6 +169,7 @@ async function handleLogin(e) {
       App.token = data.token;
       App.user = data.user;
       localStorage.setItem('planpulse_token', data.token);
+      localStorage.removeItem('planpulse_logged_out');
       showToast(data.message, '👋');
       closeAuthModal();
       checkAuth();
@@ -144,7 +182,7 @@ async function handleLogin(e) {
 }
 
 async function handleRegister(e) {
-  e.preventDefault();
+  if (e) e.preventDefault();
   const name = document.getElementById('regName').value.trim();
   const email = document.getElementById('regEmail').value.trim();
   const password = document.getElementById('regPassword').value;
@@ -162,6 +200,7 @@ async function handleRegister(e) {
       App.token = data.token;
       App.user = data.user;
       localStorage.setItem('planpulse_token', data.token);
+      localStorage.removeItem('planpulse_logged_out');
       showToast('Account created! Welcome to PlanPulse.', '🎉');
       closeAuthModal();
       checkAuth();
@@ -176,8 +215,13 @@ async function handleRegister(e) {
 function logout(notify = true) {
   App.user = null;
   App.token = null;
+  App.activeProject = null;
   localStorage.removeItem('planpulse_token');
+  localStorage.setItem('planpulse_logged_out', 'true');
   if (App.socket) App.socket.close();
+  updateUserSidebar();
+  renderProjectsSidebar();
+  renderKanbanBoard();
   if (notify) showToast('Signed out.', 'ℹ️');
   openAuthModal('login');
 }
@@ -554,24 +598,79 @@ async function handleDrop(e, targetStatus) {
 let quickAddColumnStatus = 'todo';
 
 function openQuickAddTask(status = 'todo') {
+  if (!App.token || !App.user) {
+    showToast('Please sign in with a demo account first.', '🔒');
+    openAuthModal('login');
+    return;
+  }
+
+  if (!App.activeProject) {
+    if (App.projects && App.projects.length > 0) {
+      selectProject(App.projects[0].id);
+    } else {
+      showToast('Please create a project board first.', '📁');
+      openModal('projectModal');
+      return;
+    }
+  }
+
   quickAddColumnStatus = status;
-  document.getElementById('newTaskStatus').value = status;
+  const statusInput = document.getElementById('newTaskStatus');
+  if (statusInput) statusInput.value = status;
   openModal('newTaskModal');
+
+  setTimeout(() => {
+    const titleInput = document.getElementById('newTaskTitle');
+    if (titleInput) titleInput.focus();
+  }, 100);
 }
 
 async function handleCreateTask(e) {
-  e.preventDefault();
-  if (!App.activeProject) return;
+  if (e) e.preventDefault();
 
-  const title = document.getElementById('newTaskTitle').value.trim();
-  const description = document.getElementById('newTaskDesc').value.trim();
-  const status = document.getElementById('newTaskStatus').value;
-  const priority = document.getElementById('newTaskPriority').value;
-  const assignedTo = document.getElementById('newTaskAssignee').value;
-  const dueDate = document.getElementById('newTaskDueDate').value;
-  const label = document.getElementById('newTaskLabel').value.trim();
+  if (!App.token || !App.user) {
+    showToast('Please sign in to add tasks.', '🔒');
+    openAuthModal('login');
+    return;
+  }
 
-  if (!title) return;
+  if (!App.activeProject) {
+    if (App.projects && App.projects.length > 0) {
+      selectProject(App.projects[0].id);
+    } else {
+      showToast('Please select or create a project board first.', '📁');
+      openModal('projectModal');
+      return;
+    }
+  }
+
+  const titleInput = document.getElementById('newTaskTitle');
+  const descInput = document.getElementById('newTaskDesc');
+  const statusInput = document.getElementById('newTaskStatus');
+  const priorityInput = document.getElementById('newTaskPriority');
+  const assigneeInput = document.getElementById('newTaskAssignee');
+  const dueDateInput = document.getElementById('newTaskDueDate');
+  const labelInput = document.getElementById('newTaskLabel');
+
+  const title = titleInput ? titleInput.value.trim() : '';
+  const description = descInput ? descInput.value.trim() : '';
+  const status = statusInput ? statusInput.value : 'todo';
+  const priority = priorityInput ? priorityInput.value : 'medium';
+  const assignedTo = assigneeInput ? assigneeInput.value : '';
+  const dueDate = dueDateInput ? dueDateInput.value : '';
+  const label = labelInput ? labelInput.value.trim() : '';
+
+  if (!title) {
+    showToast('Please enter a task title.', '⚠️');
+    if (titleInput) titleInput.focus();
+    return;
+  }
+
+  const submitBtn = document.getElementById('btnSubmitCreateTask') || document.querySelector('#createTaskForm button[type="submit"]');
+  if (submitBtn) {
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Adding Task...';
+  }
 
   try {
     const res = await fetch(`/api/projects/${App.activeProject.id}/tasks`, {
@@ -584,14 +683,27 @@ async function handleCreateTask(e) {
     });
     const data = await res.json();
 
-    if (data.success) {
-      document.getElementById('createTaskForm').reset();
+    if (res.ok && data.success) {
+      const form = document.getElementById('createTaskForm');
+      if (form) form.reset();
       closeModal('newTaskModal');
       showToast('Task added to board!', '📌');
-      loadProjectTasks(App.activeProject.id);
+      await loadProjectTasks(App.activeProject.id);
+      await loadProjects(false);
+    } else {
+      showToast(data.message || 'Failed to create task.', '❌');
+      if (res.status === 401 || res.status === 403) {
+        openAuthModal('login');
+      }
     }
   } catch (err) {
-    showToast('Failed to add task.', '⚠️');
+    console.error('Task creation error:', err);
+    showToast('Network error while adding task.', '⚠️');
+  } finally {
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = 'Create Task';
+    }
   }
 }
 
@@ -801,7 +913,7 @@ function closeModal(id) {
 // ==========================================
 // 8. INITIALIZATION
 // ==========================================
-document.addEventListener('DOMContentLoaded', () => {
+function initializeApp() {
   checkAuth();
 
   // Project form
@@ -819,10 +931,17 @@ document.addEventListener('DOMContentLoaded', () => {
   const regForm = document.getElementById('registerForm');
   if (regForm) regForm.addEventListener('submit', handleRegister);
 
-  // Close modals on background click
+  // Close modals on background click (except auth modal if user is not logged in)
   document.querySelectorAll('.modal-overlay').forEach(overlay => {
     overlay.addEventListener('click', (e) => {
+      if (overlay.id === 'authModal' && !App.token) return;
       if (e.target === overlay) overlay.classList.remove('active');
     });
   });
-});
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initializeApp);
+} else {
+  initializeApp();
+}
